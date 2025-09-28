@@ -1,9 +1,11 @@
 import express from 'express';
+import path from 'path';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { MongoClient } from 'mongodb';
 import { WebSocketServer } from 'ws';
+import { spawn } from 'child_process';
 import requestLogger from './logging/requestLogger.js';
 import responseLogger from './logging/responseLogger.js';
 import crypto from 'crypto';
@@ -135,6 +137,7 @@ app.post('/api/users/create', createAccountLimiter, async (req, res) => {
           user_email: email,
           hash: userhash,
           salt: salt,
+          friends: [],
           createdAt: newDate,
           updatedAt: newDate
       };
@@ -214,10 +217,10 @@ app.post('/api/users/login', loginLimiter, async (req, res) => {
 
       const userhash = crypto.pbkdf2Sync(pw, saltResult?.salt, 100000, 64, 'sha256').toString('base64');
 
-      // Check if a user with the provided username and hashed password exists
-      const id = await db.collection('users').findOne({ user_email: email, hash: userhash }, { projection: { _id: 1 } });
+      // Check if a user with the provided email and hashed password exists
+      const userDoc = await db.collection('users').findOne({ user_email: email, hash: userhash }, { projection: { _id: 1, username: 1 } });
 
-      if (!id) {
+      if (!userDoc) {
         // User not found
         const invalidResponse = {"message": "Invalid credentials"};
         responseLogger(401, invalidResponse, req);
@@ -225,7 +228,7 @@ app.post('/api/users/login', loginLimiter, async (req, res) => {
       }
 
       // At this point, credentials have been validated
-      const session = await db.collection('sessions').findOne({ user_id: id});
+      const session = await db.collection('sessions').findOne({ user_id: userDoc._id});
       if (session && session?.expires_at > new Date()) {
         const successResponse = {"message": "User found! Session already established."};
         responseLogger(200, successResponse, req);
@@ -237,7 +240,7 @@ app.post('/api/users/login', loginLimiter, async (req, res) => {
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min TTL
       const newSession = {
         session_id: sessionValue,
-        user_id: id,
+        user_id: userDoc._id,
         expires_at: expiresAt
       };
 
@@ -252,7 +255,7 @@ app.post('/api/users/login', loginLimiter, async (req, res) => {
       return res.status(201).json(successResponse);
       
   } catch (error) {
-      const errorResponse = {"Error": "Internal server error"};
+      const errorResponse = {"Error": error.message};
       responseLogger(500, errorResponse, req);
       return res.status(500).json(errorResponse);
   }
@@ -301,13 +304,320 @@ app.get('/api/users/protected', authN, (req, res) => {
   return res.status(200).json(successResponse);
 });
 
+// Get current user info
+app.get('/api/users/me', authN, async (req, res) => {
+  try {
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId }, { projection: { _id: 1, user_id: 1 } });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    const user = await db.collection('users').findOne(
+      { _id: session.user_id }, 
+      { projection: { username: 1, user_email: 1, _id: 0 } }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json({ username: user.username, user_email: user.user_email });
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Search users by username
+app.get('/api/users/search/:username', authN, async (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    if (!username || username.length < 2) {
+      return res.status(400).json({ message: "Username must be at least 2 characters" });
+    }
+
+    const users = await db.collection('users').find(
+      { username: { $regex: username, $options: 'i' } },
+      { projection: { username: 1, user_email: 1, score: 1, _id: 0 } }
+    ).limit(10).toArray();
+
+    res.json(users.map(user => ({ 
+      username: user.username, 
+      email: user.user_email,
+      score: user.score || 0
+    })));
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// AI Agent endpoint
+app.post('/api/agent/pathway', authN, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) {
+      return res.status(400).json({ message: "Message is required" });
+    }
+
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    // Set environment variables for Python script
+    process.env.USER_MESSAGE = message;
+    process.env.SESSION_ID = sessionId;
+    process.env.USER_ID = session.user_id.toString();
+
+    // Execute Python agent
+    const pythonProcess = spawn('./strands-env/bin/python', ['agent.py'], {
+      cwd: './athena',
+      env: { ...process.env, PATH: "/usr/local/opt/python@3.12/libexec/bin:" + process.env.PATH }
+    });
+
+    let output = '';
+    let error = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      error += data.toString();
+    });
+
+    pythonProcess.on('close', async (code) => {
+      if (code !== 0) {
+        console.error('Python script error:', error);
+        return res.status(500).json({ message: "Agent processing failed", error });
+      }
+
+      try {
+        console.log('Python output:', output);
+        console.log('Python error:', error);
+        
+        // Parse the agent output to get the pathway data
+        const lines = output.trim().split('\n');
+        const lastLine = lines[lines.length - 1];
+        
+        if (lastLine === '201') {
+          res.status(201).json({ message: "Pathway created successfully" });
+        } else {
+          res.status(500).json({ message: "Failed to save pathway", output, error });
+        }
+      } catch (parseError) {
+        console.error('Error parsing agent output:', parseError);
+        res.status(500).json({ message: "Error processing agent response" });
+      }
+    });
+
+  } catch (error) {
+    console.error('Agent endpoint error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get user pathways
+app.get('/api/pathways', authN, async (req, res) => {
+  try {
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    const pathways = await db.collection('pathways').find({ user_id: session.user_id.toString() }).toArray();
+    res.json({ pathways });
+  } catch (error) {
+    console.error('Get pathways error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update task status
+app.patch('/api/pathways/task', authN, async (req, res) => {
+  try {
+    const { levelNumber, stepNumber, taskId, status } = req.body;
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    const result = await db.collection('pathways').updateOne(
+      { 
+        user_id: session.user_id.toString(),
+        "pathway.levels.levelNumber": levelNumber,
+        "pathway.levels.steps.stepNumber": stepNumber,
+        "pathway.levels.steps.tasks.id": taskId
+      },
+      { 
+        $set: { "pathway.levels.$[level].steps.$[step].tasks.$[task].status": status }
+      },
+      {
+        arrayFilters: [
+          { "level.levelNumber": levelNumber },
+          { "step.stepNumber": stepNumber },
+          { "task.id": taskId }
+        ]
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      res.json({ message: "Task status updated successfully" });
+    } else {
+      res.status(404).json({ message: "Task not found" });
+    }
+  } catch (error) {
+    console.error('Update task error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update step status
+app.patch('/api/pathways/step', authN, async (req, res) => {
+  try {
+    const { levelNumber, stepNumber, status } = req.body;
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    const result = await db.collection('pathways').updateOne(
+      { 
+        user_id: session.user_id.toString(),
+        "pathway.levels.levelNumber": levelNumber,
+        "pathway.levels.steps.stepNumber": stepNumber
+      },
+      { 
+        $set: { "pathway.levels.$[level].steps.$[step].status": status }
+      },
+      {
+        arrayFilters: [
+          { "level.levelNumber": levelNumber },
+          { "step.stepNumber": stepNumber }
+        ]
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      res.json({ message: "Step status updated successfully" });
+    } else {
+      res.status(404).json({ message: "Step not found" });
+    }
+  } catch (error) {
+    console.error('Update step error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update level status
+app.patch('/api/pathways/level', authN, async (req, res) => {
+  try {
+    const { levelNumber, status } = req.body;
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    // Update current level to completed and next level to in-progress
+    const updates = [
+      {
+        updateOne: {
+          filter: { 
+            user_id: session.user_id.toString(),
+            "pathway.levels.levelNumber": levelNumber
+          },
+          update: { 
+            $set: { "pathway.levels.$.status": "completed" }
+          }
+        }
+      }
+    ];
+
+    // If there's a next level, set it to in-progress
+    const nextLevelNumber = levelNumber + 1;
+    updates.push({
+      updateOne: {
+        filter: { 
+          user_id: session.user_id.toString(),
+          "pathway.levels.levelNumber": nextLevelNumber
+        },
+        update: { 
+          $set: { "pathway.levels.$.status": "in-progress" }
+        }
+      }
+    });
+
+    await db.collection('pathways').bulkWrite(updates);
+    res.json({ message: "Level status updated successfully" });
+  } catch (error) {
+    console.error('Update level error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update user score
+app.patch('/api/user/score', authN, async (req, res) => {
+  try {
+    const { score } = req.body;
+    const sessionId = req.cookies.session_id;
+    const session = await db.collection('sessions').findOne({ session_id: sessionId });
+    
+    if (!session) {
+      return res.status(401).json({ message: "Session not found" });
+    }
+
+    const user = await db.collection('users').findOne({ _id: session.user_id });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const result = await db.collection('users').updateOne(
+      { email: user.email },
+      { $set: { score: score } }
+    );
+
+    if (result.modifiedCount > 0) {
+      res.json({ message: "Score updated successfully" });
+    } else {
+      res.status(404).json({ message: "User not found" });
+    }
+  } catch (error) {
+    console.error('Update score error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Send friend request
 app.post('/friend-request', authN, async (req, res) => {
   try {
     const { senderUsername, senderEmail, receiverUsername, receiverEmail } = req.body;
     
+    // Check if friend request already exists
+    const existingUser = await db.collection('users').findOne({
+      username: receiverUsername,
+      user_email: receiverEmail,
+      'friends.username': senderUsername,
+      'friends.user_email': senderEmail
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ error: "Friend request already exists" });
+    }
+    
     await db.collection('users').updateOne(
-      { username: receiverUsername, email: receiverEmail },
+      { username: receiverUsername, user_email: receiverEmail },
       { 
         $push: { 
           friends: { 
@@ -338,9 +648,9 @@ app.post('/accept-friend', authN, async (req, res) => {
     await db.collection('users').updateOne(
       { 
         username: accepterUsername, 
-        email: accepterEmail,
+        user_email: accepterEmail,
         'friends.username': requesterUsername,
-        'friends.email': requesterEmail
+        'friends.user_email': requesterEmail
       },
       { 
         $set: { 
@@ -351,12 +661,12 @@ app.post('/accept-friend', authN, async (req, res) => {
     );
 
     await db.collection('users').updateOne(
-      { username: requesterUsername, email: requesterEmail },
+      { username: requesterUsername, user_email: requesterEmail },
       { 
         $push: { 
           friends: { 
             username: accepterUsername, 
-            email: accepterEmail, 
+            user_email: accepterEmail, 
             accepted: true,
             timestamp: new Date()
           } 
@@ -376,31 +686,36 @@ app.post('/accept-friend', authN, async (req, res) => {
 });
 
 // Get friends list
-app.get('/friends/:username/:email', async (req, res) => {
+app.get('/friends/:username/:email',authN, async (req, res) => {
   try {
     const { username, email } = req.params;
-    const user = await db.collection('users').findOne({ username, email }, { projection: { friends: 1, _id: 0 } });
-    res.json({ friends: user?.friends || [] });
+    const user = await db.collection('users').findOne({ username, user_email: email }, { projection: { friends: 1, _id: 0 } });
+    
+    // Get scores for each friend
+    const friendsWithScores = await Promise.all(
+      (user?.friends || []).map(async (friend) => {
+        const friendUser = await db.collection('users').findOne(
+          { user_email: friend.email },
+          { projection: { score: 1, _id: 0 } }
+        );
+        return {
+          ...friend,
+          score: friendUser?.score || 0
+        };
+      })
+    );
+    
+    responseLogger(200, { friends: friendsWithScores }, req);
+    return res.status(200).json({ friends: friendsWithScores });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Webhook endpoint
-app.post('/webhook/friends-update', (req, res) => {
-  const { username, email, friendsData } = req.body;
-  console.log(`Webhook: Sending updated friends data to ${username} (${email})`);
-  
-  // In real implementation, this would push to WebSocket, SSE, or frontend polling endpoint
-  // For now, we'll log the data that would be sent to frontend
-  console.log('Updated friends data:', friendsData);
-  
-  res.json({ received: true, friendsData });
-});
 
 async function triggerWebhook(username, email) {
   try {
-    const user = await db.collection('users').findOne({ username, email }, { projection: { friends: 1, _id: 0 } });
+    const user = await db.collection('users').findOne({ username, user_email: email }, { projection: { friends: 1, _id: 0 } });
     const friendsData = user?.friends || [];
     
     // Send via WebSocket to connected client
@@ -419,13 +734,15 @@ async function triggerWebhook(username, email) {
   }
 }
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
 });
 
-// WebSocket server
-const wss = new WebSocketServer({ port: 8080 });
+// WebSocket server on same port as HTTP server
+const wss = new WebSocketServer({ server });
 const clients = new Map();
+
+console.log('WebSocket server running on same port as HTTP server');
 
 wss.on('connection', (ws) => {
   ws.on('message', (message) => {
@@ -446,4 +763,13 @@ wss.on('connection', (ws) => {
       }
     }
   });
+});
+
+// Serve frontend static files
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// Catch-all handler for frontend routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
 });
