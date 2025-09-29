@@ -765,11 +765,11 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Serve frontend static files
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
-app.use(express.static(path.join(__dirname, '../frontend/dist')));
+// // Serve frontend static files
+// const __dirname = path.dirname(new URL(import.meta.url).pathname);
+// app.use(express.static(path.join(__dirname, '../frontend/dist')));
 
-// Catch-all handler for frontend routes
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
-});
+// // Catch-all handler for frontend routes
+// app.get('/:path(*)', (req, res) => {
+//   res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+// });
